@@ -68,28 +68,96 @@ Sam now announces when the washing machine is done.
 
 ---
 
+## Files
+
+| File | Description |
+|------|-------------|
+| `mssam_wav_generator.vbs` | VBScript that drives SAPI to batch-export WAV files from the corpus |
+| `mssam_training_corpus.txt` | The training corpus — 400+ utterances covering meme phonetics, pangrams, programming vocab, numbers, punctuation, and abstract language |
+| `screenshots/` | Full documented pipeline, 16 images |
+
+---
+
+## Reproducing This
+
+You'll need a Windows XP VM with Microsoft Sam installed (SAPI voice index 0). Everything else follows from the script.
+
+**1. Set up the VM**
+
+Any QEMU/KVM or VirtualBox WinXP install will work. Confirm Sam is available via Control Panel → Speech → Text To Speech.
+
+**2. Transfer files to the VM**
+
+Mount an SMB share or use a shared folder to get `mssam_wav_generator.vbs` and `mssam_training_corpus.txt` into the same directory on the VM.
+
+**3. Run the generator**
+
+```
+cscript mssam_wav_generator.vbs
+```
+
+This will create a `wav_output/` folder and generate one numbered WAV per corpus line. 444 files, ~97MB, 22kHz 16-bit mono.
+
+**4. Transfer the dataset back to Linux**
+
+```bash
+# Mount the SMB share and copy wav_output/
+cp -r /mnt/share/wav_output ~/piper/mssam_dataset
+```
+
+Pair each WAV with its transcript line — the numbered filenames map 1:1 to corpus lines.
+
+**5. Preprocess for Piper**
+
+```bash
+python3 -m piper_train.preprocess \
+  --language en-us \
+  --input-dir ~/piper/mssam_dataset \
+  --output-dir ~/piper/mssam_training \
+  --dataset-format ljspeech \
+  --single-speaker \
+  --sample-rate 22050
+```
+
+**6. Train**
+
+```bash
+python3 -m piper_train \
+  --dataset-dir ~/piper/mssam_training \
+  --accelerator gpu \
+  --checkpoint-epochs 1
+```
+
+Fine-tune from a Lessac checkpoint for best results. Training on an RTX 3080 with 444 samples runs for hours at 6000 epochs. Watch the loss values — they should decrease steadily.
+
+**7. Deploy**
+
+Export the checkpoint to an `.onnx` model and load it into Piper TTS. Drop it in your voice directory and point Home Assistant (or any Piper-compatible system) at it.
+
+---
+
 ## Screenshots
 
 The full documented pipeline lives in `/screenshots`:
 
-| # | What it shows |
-|---|---------------|
-| 01 | WinXP setup boot in QEMU/KVM |
-| 02 | WinXP Professional Setup — Regional and Language Options |
-| 03 | WinXP install progress |
-| 04 | WinXP desktop — Bliss wallpaper, clean install confirmed |
-| 05 | Speech Properties — Microsoft Sam selected as default voice |
-| 06 | Device Manager — MS-SAM-XP hardware profile |
-| 07 | XP CMD — network connectivity test to host (ping, telnet) |
-| 08 | SMB share mounted from host |
-| 09 | wav_output folder — 444 files, 97.3MB confirmed |
-| 10 | Piper preprocessing — 444 utterances, 8 workers |
-| 11 | Training corpus — the meme dataset |
-| 12 | VBScript generator — SAPI batch export logic |
-| 13 | wav_output file listing — 444 WAVs + paired txt transcripts |
-| 14 | PyTorch Lightning training — RTX 3080, CUDA, loss running |
-| 15 | Home Assistant Assist — Microsoft Sam deployed as voice assistant |
-| 16 | XP Speech Properties — Microsoft Sam voice selection detail |
+| File | What it shows |
+|------|---------------|
+| `01-qemu-winxp-boot.png` | WinXP setup boot in QEMU/KVM |
+| `02-winxp-setup-regional.png` | WinXP Professional Setup — Regional and Language Options |
+| `03-winxp-setup-progress.png` | WinXP install progress |
+| `04-winxp-desktop-clean.png` | WinXP desktop — Bliss wallpaper, clean install confirmed |
+| `05-sapi-microsoft-sam-selected.png` | Speech Properties — Microsoft Sam selected as default voice |
+| `06-device-manager-ms-sam-xp.png` | Device Manager — MS-SAM-XP hardware profile |
+| `07-xp-cmd-network-test.png` | XP CMD — network connectivity test to host (ping, telnet) |
+| `08-smb-share-mounted.png` | SMB share mounted from host |
+| `09-wav-output-444-files.png` | wav_output folder — 444 files, 97.3MB confirmed |
+| `10-piper-preprocessing-444-utterances.png` | Piper preprocessing — 444 utterances, 8 workers |
+| `11-training-corpus-meme-dataset.png` | Training corpus — the meme dataset |
+| `12-vbscript-sapi-batch-export.png` | VBScript generator — SAPI batch export logic |
+| `13-wav-output-file-listing.png` | wav_output file listing — 444 WAVs + paired txt transcripts |
+| `14-pytorch-training-rtx3080-cuda.png` | PyTorch Lightning training — RTX 3080, CUDA, loss running |
+| `15-homeassistant-mssam-deployed.png` | Home Assistant Assist — Microsoft Sam deployed as voice assistant |
+| `16-sapi-voice-selection-detail.png` | XP Speech Properties — Microsoft Sam voice selection detail |
 
 ---
 
