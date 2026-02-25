@@ -1,0 +1,42 @@
+# Piper TTS Trainer — Frozen Dependency Stack
+#
+# Building this image once saves you from dependency hell on every training run.
+# The stock NVIDIA PyTorch containers ship torch versions that break piper-train.
+# These exact versions were resolved via piper-train Discussion #167.
+#
+# Build: ./build_piper_trainer.sh
+# Use:   ./train_voice.sh <voice_name>
+
+FROM nvcr.io/nvidia/pytorch:23.10-py3
+
+LABEL maintainer="disco@balthazar"
+LABEL description="Piper TTS training environment — pinned working dependency stack"
+LABEL version="1.0"
+
+WORKDIR /workspace
+
+# Remove the container's default torch — versions conflict with piper-train
+RUN pip3 uninstall -y torch torchvision torchaudio pytorch-lightning
+
+# Pinned versions confirmed working with piper-train (Discussion #167)
+RUN pip3 install \
+    torch==2.1.0+cu121 \
+    torchvision==0.16.0+cu121 \
+    torchaudio==2.1.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+RUN pip3 install pytorch-lightning==1.8.6 torchmetrics==0.11.4
+
+# piper-phonemize: use 1.1.0 — has a Python 3.10 wheel, newer versions don't
+RUN pip3 install piper-phonemize==1.1.0
+
+# Clone piper and build the monotonic alignment extension
+RUN git clone https://github.com/rhasspy/piper.git && \
+    cd piper/src/python && \
+    pip3 install -e . && \
+    bash build_monotonic_align.sh
+
+ENV NUMBA_CACHE_DIR=/workspace/.numba_cache
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/bin/bash"]

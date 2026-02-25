@@ -1,183 +1,156 @@
 # bis-mssam
 
-**Recreating Microsoft Sam as a neural TTS voice model — from a Windows XP VM to a live Home Assistant assistant.**
+Neural TTS training pipeline for Microsoft's classic SAPI voices — Sam, Mike, and Mary.
+
+The goal was simple: these voices are a piece of internet history, and they deserved a second life. Not as nostalgia, but as actual deployable TTS voices running on modern hardware, locally, with no cloud dependency.
 
 ---
 
-## The Goal
+## What This Is
 
-Microsoft Sam doesn't exist as a modern TTS model. He exists as a SAPI voice locked inside Windows XP. The only way to get clean Sam audio is to go back in time and ask him nicely.
+This repo documents a complete pipeline for training Piper TTS models from Microsoft SAPI voice output. The approach:
 
-This project documents the full pipeline: acquiring the dataset from the original source, preprocessing it for neural training, training a Piper TTS model on local hardware, and deploying it as a production voice assistant.
+1. **Spin up a period-accurate Windows XP VM** (QEMU/KVM with SAPI 5.1 installed)
+2. **Drive SAPI from VBScript** to batch-export the training corpus as WAV files
+3. **Transfer the dataset to Linux** and preprocess it for Piper
+4. **Train via PyTorch Lightning** inside a pinned Docker container, fine-tuning from a pretrained lessac checkpoint
+5. **Export to ONNX** and deploy — in this case, as the default voice for a Home Assistant voice assistant
 
-No cloud. No shortcuts. Every stage understood before moving to the next.
+The pipeline evolved in two versions. `v1-sam/` is the original proof-of-concept for Sam. `v2-multi-voice/` generalizes it into a reusable framework for any SAPI voice, with a Dockerfile that solves the dependency hell that makes piper-train painful to set up.
 
 ---
 
-## The Pipeline
+## Repository Structure
 
-### 1. Dataset Acquisition — Windows XP VM
+```
+bis-mssam/
+├── corpus/
+│   └── training_corpus.txt       # shared training data — ~440 lines
+├── v1-sam/
+│   ├── mssam_wav_generator.vbs   # SAPI driver for Sam (Windows XP VM)
+│   └── transcript_generator.py  # pairs WAVs with .txt transcripts (Linux)
+└── v2-multi-voice/
+    ├── mike_mary.vbs              # dual-voice SAPI driver — WAV + txt + metadata.csv
+    ├── Dockerfile.piper-trainer   # pinned torch/lightning/phonemize stack
+    ├── build_piper_trainer.sh     # build the image (run once)
+    ├── setup_datasets.sh          # move datasets into place, download checkpoint
+    ├── train_voice.sh             # universal trainer — ./train_voice.sh <name>
+    ├── train_mike.sh              # convenience wrapper
+    └── train_mary.sh              # convenience wrapper
+```
 
-Sam lives in XP. So XP it is.
+---
 
-Spun up a Windows XP Professional VM in QEMU/KVM. Configured the SAPI Text-to-Speech engine with Microsoft Sam as the active voice. Wrote a VBScript generator (`mssam_wav_generator.v2.vbs`) to drive the SAPI interface programmatically — reading lines from a corpus file, invoking `SAPI.SpFileStream` at 22kHz 16-bit mono, and batch-exporting each utterance as a numbered WAV file.
+## The Corpus
 
-444 utterances. Silent generation, no popups, padded filenames for clean dataset indexing.
+`corpus/training_corpus.txt` is the shared training dataset used for all voices. It's ~440 lines covering:
 
-### 2. The Corpus
+- **Phonetic coverage** — pangrams, alphabet run, numbers, punctuation names
+- **Internet culture** — classic memes and copypasta from the era these voices lived in
+- **Technical vocabulary** — programming terms, system messages, Windows UI strings
+- **General language** — conversational phrases, abstract concepts, Latin loanwords
 
-The training corpus is curated internet — memes, catchphrases, phonetically varied nonsense that pushes Sam's voice into its full range. "All your base are belong to us." "The cake is a lie." "My roflcopter goes soi soi soi soi."
+The corpus was designed to give the model broad phoneme coverage while staying true to the context where these voices were actually heard.
 
-This wasn't arbitrary. Sam's voice has specific phonetic quirks. The corpus was designed to capture them.
+---
 
-### 3. Dataset Transfer
+## Prerequisites
 
-Transferred the WAV output folder (444 files, ~97MB) from the XP VM to the Linux training host (Balthazar) over SMB. Verified file integrity and count before proceeding.
+### Windows XP VM (for dataset generation)
+- QEMU/KVM with a Windows XP SP3 image
+- [Microsoft SAPI 5.1](https://www.microsoft.com/en-us/download/details.aspx?id=10121) (SpeechSDK51.exe)
+- For Mike and Mary: Microsoft TTS voices (msttss22L.exe or similar)
 
-### 4. Preprocessing
+### Linux training host
+- Docker with NVIDIA GPU support (`nvidia-container-toolkit`)
+- CUDA 12.1 compatible GPU (tested on RTX 3080)
+- ~10GB free disk space for training artifacts
+
+---
+
+## Quickstart
+
+### v1 — Microsoft Sam
+
+1. Set up your Windows XP VM and install SAPI 5.1
+2. Copy `v1-sam/` and `corpus/` into the VM
+3. Run `mssam_wav_generator.vbs` — generates `wav_output/001.wav` through `NNN.wav`
+4. Transfer `wav_output/` to your Linux host
+5. Run `python3 transcript_generator.py` to generate matching `.txt` files
+6. Follow Piper's standard preprocessing and training steps
+
+### v2 — Mike & Mary (and any SAPI voice)
+
+**In the Windows XP VM:**
+```
+1. Install SAPI 5.1 + Microsoft TTS voices
+2. Run mike_mary.vbs
+   — generates wav_output_mary/ and wav_output_mike/
+   — each folder contains WAVs, matching .txt files, and metadata.csv
+3. Transfer both wav_output_* folders to your Linux host
+```
+
+**On the Linux training host:**
+```bash
+# One-time setup
+cd v2-multi-voice/
+./build_piper_trainer.sh         # build the Docker image (~15 min)
+
+# Move datasets into place and download the lessac checkpoint
+./setup_datasets.sh              # run from where the wav_output_* folders are
+
+# Train
+./train_voice.sh mary
+./train_voice.sh mike
+# or: ./train_mary.sh / ./train_mike.sh
+```
+
+Output for each voice:
+```
+~/piper/ms<voice>.onnx
+~/piper/ms<voice>.onnx.json
+~/piper/test_<voice>.wav         # smoke test output
+```
+
+---
+
+## The Dockerfile
+
+The most practically useful piece of this repo is probably `v2-multi-voice/Dockerfile.piper-trainer`.
+
+Piper's training setup has a dependency conflict: the NVIDIA PyTorch base images ship torch versions that break `piper-train`, and the fix isn't documented clearly. After working through [piper-train Discussion #167](https://github.com/rhasspy/piper/discussions/167), the working stack is:
+
+```
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+torchaudio==2.1.0+cu121
+pytorch-lightning==1.8.6
+torchmetrics==0.11.4
+piper-phonemize==1.1.0   # needs Python 3.10 wheel — newer versions don't have it
+```
+
+Building this image once means you're not solving dependency conflicts on every training run.
+
+---
+
+## Notes
+
+- The `.onnx` model files are not included — they contain output derived from proprietary Microsoft voices. Train your own.
+- The lessac checkpoint (`epoch=2164-step=1355540.ckpt`) used as the training base is downloaded automatically by `setup_datasets.sh` from the [rhasspy/piper-checkpoints](https://huggingface.co/datasets/rhasspy/piper-checkpoints) dataset on Hugging Face.
+- Training takes several hours on an RTX 3080. Watch loss values stabilize — you don't need to run all 6000 epochs.
+- The smoke test line is `my roflcopter goes soi soi soi soi soi`. If it sounds right, it's right.
+
+---
+
+## Deployment
+
+The trained models deploy anywhere Piper is supported. This pipeline's output runs as the default voice assistant on a Home Assistant instance via Wyoming Protocol.
 
 ```bash
-python3 -m piper_train.preprocess \
-  --language en-us \
-  --input-dir ~/piper/mssam_dataset \
-  --output-dir ~/piper/mssam_training \
-  --dataset-format ljspeech \
-  --single-speaker \
-  --sample-rate 22050
+# Run Piper with a trained model
+echo "hello world" | piper -m ~/piper/msmary.onnx --output_file out.wav
 ```
-
-Piper's preprocessor confirmed: 444 utterances, 8 workers, single-speaker dataset config written.
-
-### 5. Training
-
-PyTorch Lightning on an RTX 3080 (10GB VRAM). CUDA 12.9. Fine-tuned from a Lessac checkpoint. GPU pegged at ~51% utilization, 9386MB memory allocated to the training process.
-
-```
-LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
-Restored all states from the checkpoint file
-Number of training batches: 14
-```
-
-Watched the loss values decrease. That's Sam's voice being learned.
-
-### 6. Deployment
-
-The trained model was loaded into Piper TTS and deployed as a Home Assistant voice assistant — Microsoft Sam, starred as default, running entirely locally on the home network alongside Amy and a full local assistant configuration.
-
-Sam now announces when the washing machine is done.
 
 ---
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `mssam_wav_generator.vbs` | VBScript that drives SAPI to batch-export WAV files from the corpus |
-| `mssam_training_corpus.txt` | The training corpus — 400+ utterances covering meme phonetics, pangrams, programming vocab, numbers, punctuation, and abstract language |
-| `screenshots/` | Full documented pipeline, 16 images |
-
----
-
-## Reproducing This
-
-You'll need a Windows XP VM with Microsoft Sam installed (SAPI voice index 0). Everything else follows from the script.
-
-**1. Set up the VM**
-
-Any QEMU/KVM or VirtualBox WinXP install will work. Confirm Sam is available via Control Panel → Speech → Text To Speech.
-
-**2. Transfer files to the VM**
-
-Mount an SMB share or use a shared folder to get `mssam_wav_generator.vbs` and `mssam_training_corpus.txt` into the same directory on the VM.
-
-**3. Run the generator**
-
-```
-cscript mssam_wav_generator.vbs
-```
-
-This will create a `wav_output/` folder and generate one numbered WAV per corpus line. 444 files, ~97MB, 22kHz 16-bit mono.
-
-**4. Transfer the dataset back to Linux**
-
-```bash
-# Mount the SMB share and copy wav_output/
-cp -r /mnt/share/wav_output ~/piper/mssam_dataset
-```
-
-Pair each WAV with its transcript line — the numbered filenames map 1:1 to corpus lines.
-
-**5. Preprocess for Piper**
-
-```bash
-python3 -m piper_train.preprocess \
-  --language en-us \
-  --input-dir ~/piper/mssam_dataset \
-  --output-dir ~/piper/mssam_training \
-  --dataset-format ljspeech \
-  --single-speaker \
-  --sample-rate 22050
-```
-
-**6. Train**
-
-```bash
-python3 -m piper_train \
-  --dataset-dir ~/piper/mssam_training \
-  --accelerator gpu \
-  --checkpoint-epochs 1
-```
-
-Fine-tune from a Lessac checkpoint for best results. Training on an RTX 3080 with 444 samples runs for hours at 6000 epochs. Watch the loss values — they should decrease steadily.
-
-**7. Deploy**
-
-Export the checkpoint to an `.onnx` model and load it into Piper TTS. Drop it in your voice directory and point Home Assistant (or any Piper-compatible system) at it.
-
----
-
-## Screenshots
-
-The full documented pipeline lives in `/screenshots`:
-
-| File | What it shows |
-|------|---------------|
-| `01-qemu-winxp-boot.png` | WinXP setup boot in QEMU/KVM |
-| `02-winxp-setup-regional.png` | WinXP Professional Setup — Regional and Language Options |
-| `03-winxp-setup-progress.png` | WinXP install progress |
-| `04-winxp-desktop-clean.png` | WinXP desktop — Bliss wallpaper, clean install confirmed |
-| `05-sapi-microsoft-sam-selected.png` | Speech Properties — Microsoft Sam selected as default voice |
-| `06-device-manager-ms-sam-xp.png` | Device Manager — MS-SAM-XP hardware profile |
-| `07-xp-cmd-network-test.png` | XP CMD — network connectivity test to host (ping, telnet) |
-| `08-smb-share-mounted.png` | SMB share mounted from host |
-| `09-wav-output-444-files.png` | wav_output folder — 444 files, 97.3MB confirmed |
-| `10-piper-preprocessing-444-utterances.png` | Piper preprocessing — 444 utterances, 8 workers |
-| `11-training-corpus-meme-dataset.png` | Training corpus — the meme dataset |
-| `12-vbscript-sapi-batch-export.png` | VBScript generator — SAPI batch export logic |
-| `13-wav-output-file-listing.png` | wav_output file listing — 444 WAVs + paired txt transcripts |
-| `14-pytorch-training-rtx3080-cuda.png` | PyTorch Lightning training — RTX 3080, CUDA, loss running |
-| `15-homeassistant-mssam-deployed.png` | Home Assistant Assist — Microsoft Sam deployed as voice assistant |
-| `16-sapi-voice-selection-detail.png` | XP Speech Properties — Microsoft Sam voice selection detail |
-
----
-
-## Stack
-
-- **VM:** QEMU/KVM, Windows XP Professional
-- **Dataset generation:** VBScript, Windows SAPI (`SAPI.SpFileStream`)
-- **Transfer:** SMB (Samba)
-- **Preprocessing:** Piper TTS training pipeline, LJSpeech format
-- **Training:** PyTorch Lightning, CUDA 12.9, RTX 3080
-- **Deployment:** Piper TTS, Home Assistant Assist
-
----
-
-## Why
-
-Because understanding a pipeline means building it from the source. Anyone can fine-tune a model from a HuggingFace checkpoint. Fewer people spin up a period-accurate VM to extract a 2001 voice engine's output as a training dataset.
-
-Also Sam deserved a second life.
-
----
-
-*Part of the [Bosman intelligent Solutions](https://github.com/bosman-solutions) portfolio.*
+*Sam deserved a second life.*
